@@ -21,7 +21,9 @@ import uuid
 from datetime import datetime, timezone
 
 from queue_model import (QueueError, require, text, sha, line, parse_proposal, decode, encode,
-                         replay, projections, blockers, TERMINAL, task_id, relative_path, PROJECTION_VERSION)
+                         replay, TERMINAL, task_id, relative_path, PROJECTION_VERSION)
+from queue_v2 import projections, blockers, CONFIG, ARCHIVE, WINDOW, home, config_bytes, config, occupied
+import state_pack
 
 LEDGER = '.shell/queue/ledger.jsonl'
 LOCAL = '.shell/local'
@@ -87,13 +89,14 @@ class Store:
         rows = []
         for ident in sorted(tasks if selected is None else selected, key=lambda key: int(key[1:])):
             item = tasks[ident]
-            home = f'{MANAGED}/{ident}'
+            task_home = home(item)
             baseline = item['approvals'][-1] if item['approvals'] else None
             delivery = item['delivery']
-            rows.append({'id': ident, 'task': self.gpath(f'{home}/task.md'),
-                         'approval': self.gpath(f"{home}/approval-{baseline['round']:03d}.md") if baseline else None,
-                         'receipt': self.gpath(f"{home}/receipt-{delivery['seq']:06d}.md") if delivery else None,
-                         'legacy': self.gpath(f'{home}/legacy-import.md') if item['legacy'] else None})
+            rows.append({'id': ident, 'task': self.gpath(f'{task_home}/task.md'),
+                         'approval': self.gpath(f"{task_home}/approval-{baseline['round']:03d}.md") if baseline else None,
+                         'receipt': self.gpath(f"{task_home}/receipt-{delivery['seq']:06d}.md") if delivery else None,
+                         'legacy': self.gpath(f'{task_home}/legacy-import.md') if item['legacy'] else None,
+                         'package': sorted(self.gpath(p) for p in projections(tasks) if p.startswith(task_home + '/'))})
         result = {'base': str(self.repo), 'ledger': self.gpath(LEDGER), 'tasks': rows}
         if stage_paths is not None:
             result['stage_paths'] = sorted(set(stage_paths))
@@ -196,13 +199,12 @@ class Store:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
-    def actual_files(self):
-        base = safe(self.root, MANAGED)
-        if not base.exists():
-            return {}
-        require(base.is_dir(), '任务区不是目录。', 'path')
+    def actual_files(self, include_config=False):
         found = {}
-        for directory, dirs, files in os.walk(base, followlinks=False):
+        roots = [safe(self.root, p) for p in (MANAGED, ARCHIVE)]
+        for base in roots:
+            require(not base.exists() or base.is_dir(), '受管区不是目录。', 'path')
+        for directory, dirs, files in (row for base in roots for row in os.walk(base, followlinks=False)):
             for name in dirs + files:
                 p = Path(directory) / name
                 require(not p.is_symlink(), f'任务区不能放符号链接：{p.name}。', 'path')
@@ -211,17 +213,22 @@ class Store:
                 rel = p.relative_to(self.root).as_posix()
                 if rel == MANAGED + '/.gitkeep' or name == '.DS_Store':
                     continue
+                require(p.is_file(), '受管区仅支持普通文件。', 'path')
                 found[rel] = p.read_bytes()
+        if include_config and safe(self.root, CONFIG).is_file():
+            found[CONFIG] = safe(self.root, CONFIG).read_bytes()
         return found
 
     def verify_files(self, tasks):
-        expected, actual = projections(tasks), self.actual_files()
+        expected = projections(tasks)
+        actual = self.actual_files(include_config=CONFIG in expected)
         bad = sorted(k for k in expected.keys() | actual.keys() if expected.get(k) != actual.get(k))
         require(not bad, '任务视图或附件与机器账不一致：' + '、'.join(bad[:5]) +
                 '。先用 repair 保留差异并重建，不要继续手改。', 'projection')
 
     def publish(self, tasks, previous=None):
-        expected, actual = projections(tasks), self.actual_files()
+        expected = projections(tasks)
+        actual = self.actual_files(include_config=CONFIG in expected)
         # Normal generated updates need no backup; preserve unexpected human differences.
         previous = previous or {}
         differing = {k: v for k, v in actual.items() if expected.get(k) != v and previous.get(k) != v}
@@ -237,6 +244,11 @@ class Store:
                 self.atomic_write(safe(self.root, name), content)
         for name in actual.keys() - expected.keys():
             safe(self.root, name).unlink()
+        for base in (safe(self.root, MANAGED), safe(self.root, ARCHIVE)):
+            if base.exists():
+                for directory, _, _ in os.walk(base, topdown=False):
+                    p = Path(directory)
+                    if p != base and not any(p.iterdir()): p.rmdir()
         return str(saved) if saved else None
 
     def read(self):
@@ -403,12 +415,12 @@ class Store:
         require(old_raw is None or raw.startswith(old_raw), '暂存账本改写或删除了既有历史，提交拒绝。', 'history')
         require(not any(p.startswith(self.gpath(LOCAL + '/')) for p in index), '运行态目录被加入暂存，提交拒绝。', 'index')
         expected = {self.gpath(k): v for k, v in projections(tasks).items()}
-        actual = {k: self.blob(index, k) for k in index if k.startswith(self.gpath(MANAGED + '/'))
+        actual = {k: self.blob(index, k) for k in index if (k.startswith(self.gpath(MANAGED + '/')) or k.startswith(self.gpath(ARCHIVE + '/')) or (tasks.protocol == 2 and k == self.gpath(CONFIG)))
                   and k != self.gpath(MANAGED + '/.gitkeep')}
         require(actual == expected, '暂存任务视图或附件与账本不一致；不可只暂存部分队列文件。', 'projection')
         for ident, item in replay(old_events).items():
-            if item['status'] in TERMINAL:
-                prefix = self.gpath(f'{MANAGED}/{ident}/')
+            if item['status'] in TERMINAL | {'通过', None}:
+                prefix = self.gpath(home(item) + '/')
                 require({p: row for p, row in head.items() if p.startswith(prefix)} ==
                         {p: row for p, row in index.items() if p.startswith(prefix)},
                         f'{ident} 已在 Git 中封存，整卷不能增删改。', 'sealed')
@@ -418,8 +430,8 @@ class Store:
                 self.verify_delivery(item, index)
         # Check actual index blobs, never trust a matching working copy instead.
         require(self.ledger.read_bytes() == raw, '工作账与暂存账不一致；请同批暂存后再提交。', 'index')
-        require(self.actual_files() == projections(tasks), '工作任务视图与暂存状态不一致。', 'index')
-        for relative in ('tool/task_queue.py', 'tool/queue_model.py'):
+        require(self.actual_files(include_config=tasks.protocol == 2) == projections(tasks), '工作任务视图与暂存状态不一致。', 'index')
+        for relative in ('tool/task_queue.py', 'tool/queue_model.py', 'tool/queue_v2.py', 'tool/state_pack.py', 'tool/shell.py'):
             require(self.blob(index, self.gpath(relative)) == safe(self.root, relative).read_bytes(),
                     f'检查器 {relative} 与暂存版本不同；请完整暂存工具变更。', 'index')
         require(self.index() == index, '检查期间暂存区发生变化，请重新提交。', 'conflict')
@@ -476,14 +488,24 @@ def parser():
     sub.add_parser('doctor', help='核对保护接线、账本与视图')
     p = sub.add_parser('check'); p.add_argument('--staged', action='store_true')
     sub.add_parser('repair', help='保留投影差异后重建；不猜测修改坏账')
-    p = sub.add_parser('status'); p.add_argument('id', nargs='?')
+    for op in ('status', 'history'):
+        p = sub.add_parser(op); p.add_argument('id', nargs='?')
+    p = sub.add_parser('state-get'); p.add_argument('--chunk-chars', type=int, default=24000)
+    p = sub.add_parser('state-check'); p.add_argument('--context', required=True)
+    sub.add_parser('config-show')
+    for op in ('upgrade', 'config-set'):
+        p = sub.add_parser(op)
+        p.add_argument('--preview', action='store_true'); p.add_argument('--expect-source')
+        p.add_argument('--file'); p.add_argument('--context'); p.add_argument('--recover', action='store_true')
+        p.add_argument('--actor'); p.add_argument('--request'); p.add_argument('--by'); p.add_argument('--basis')
     p = sub.add_parser('migrate', help='只导入旧版未认领候裁记录，不推断历史授权')
     p.add_argument('--preview', action='store_true'); p.add_argument('--expect-source')
     p.add_argument('--actor'); p.add_argument('--request'); p.add_argument('--by'); p.add_argument('--basis')
-    for op in ('create', 'revise', 'approve', 'claim', 'release', 'handoff', 'replan', 'deliver', 'close', 'revoke', 'cancel'):
+    for op in ('create', 'revise', 'approve', 'claim', 'release', 'handoff', 'replan', 'deliver', 'close', 'revoke', 'cancel', 'rework'):
         p = sub.add_parser(op)
         if op != 'create':
             p.add_argument('id'); p.add_argument('--expect', type=int, required=True, help='刚读到的任务 revision')
+        p.add_argument('--context', help='state get 返回的状态版本；每个调用者独立携带')
         p.add_argument('--actor', required=True, help='本次执行者，归因而非身份认证')
         p.add_argument('--request', required=True, help='本次逻辑请求的稳定唯一号，重试沿用')
         if op in ('create', 'revise'):
@@ -503,7 +525,7 @@ def parser():
             p.add_argument('--text', required=True)
         if op == 'replan':
             p.add_argument('--plan', required=True, help='计划文本文件'); p.add_argument('--basis', required=True)
-        if op == 'revise':
+        if op in {'revise', 'rework'}:
             p.add_argument('--basis', required=True)
         if op == 'deliver':
             p.add_argument('--artifact', action='append', required=True, help='Git 仓库相对普通文件路径')
@@ -536,6 +558,11 @@ def execute(args):
                     text(args.actor, '操作者', 200); text(args.request, '请求号', 200)
                     data = {'tasks': rows, 'authority': get_authority(args)}
                     events = [make_event([], 'import', data, args.actor, args.request, sha(line(data).encode()))]
+                if not events:
+                    policy = state_pack.load_config(store)
+                    event = make_event([], 'upgrade', {'authority': {'by': '实例接入', 'basis': '初始化当前模板协议，不批准任何任务'}, 'source_sha256': sha(b'')}, 'system:init', 'init-protocol-2', sha(line(policy).encode()))
+                    event.update(protocol=2, config=policy, context='')
+                    events = [event]
                 tasks = replay(events)  # Validate the whole import before changing hooks or ledger.
                 store.ensure_ignore(); store.install_hooks(); store.protection()
                 store.commit(b'', events, tasks)
@@ -544,7 +571,7 @@ def execute(args):
                 store.ensure_ignore(); store.install_hooks(); store.protection()
             raw, events, tasks = store.read()
             store.preserve_prefix(raw); store.verify_files(tasks)
-            stage = [store.gpath(p) for p in (LEDGER, '.gitignore', 'tool/task_queue.py', 'tool/queue_model.py')]
+            stage = [store.gpath(p) for p in (LEDGER, '.gitignore', 'tool/task_queue.py', 'tool/queue_model.py', 'tool/queue_v2.py', 'tool/state_pack.py', 'tool/shell.py', CONFIG)]
             stage.extend(store.gpath(p) for p in projections(tasks))
             return {'ok': True, 'protection': 'ready', 'tasks': len(tasks), 'seq': len(events),
                     'files': store.response_files(tasks, stage_paths=stage),
@@ -553,7 +580,7 @@ def execute(args):
         raw, events, tasks = store.read()
         store.preserve_prefix(raw)
         if op == 'repair':
-            before = store.actual_files()
+            before = store.actual_files(include_config=tasks.protocol == 2)
             saved = store.publish(tasks)
             store.verify_files(tasks)
             expected = projections(tasks)
@@ -562,18 +589,32 @@ def execute(args):
                      if before.get(p) != expected.get(p) and (p in expected or store.gpath(p) in tracked)]
             return {'ok': True, 'repaired': True, 'saved_differences': saved, 'seq': len(events),
                     'files': store.response_files(tasks, stage_paths=stage)}
+        if op in {'upgrade', 'config-show', 'config-set'}:
+            return control(store, args, raw, events, tasks)
         store.verify_files(tasks)
+        if op == 'state-get': return state_pack.get(store, raw, events, tasks, args.chunk_chars)
+        if op == 'state-check': return state_pack.check(store, raw, events, tasks, args.context)
         if op in {'doctor', 'check'}:
             if getattr(args, 'staged', False):
                 return store.check_staged()
-            return {'ok': True, 'protection': 'ready', 'seq': len(events), 'tasks': len(tasks)}
-        if op == 'status':
+            return {'ok': True, 'protection': 'ready', 'seq': len(events), 'tasks': sum(t['status'] is not None for t in tasks.values()), 'protocol': tasks.protocol}
+        if op in {'status', 'history'}:
             require(args.id is None or args.id in tasks, '任务不存在。', 'identity')
             selected = tasks if args.id is None else {args.id: tasks[args.id]}
-            return {'ok': True, 'seq': len(events), 'files': store.response_files(tasks, selected), 'tasks': [
-                {k: t[k] for k in ('id', 'status', 'revision', 'assignee', 'parent', 'deps', 'round')} |
-                {'title': t['proposal']['title'], 'ready': not blockers(tasks, ident), 'blocked': blockers(tasks, ident)}
-                for ident, t in selected.items()]}
+            if op == 'status':
+                require(args.id is None or tasks[args.id]['status'] is not None, '任务已取消移出队列；使用 task history 查历史。', 'removed')
+                selected = {k: t for k, t in selected.items() if t['status'] is not None}
+            rows = []
+            for ident, t in selected.items():
+                row = {k: t[k] for k in ('id', 'revision', 'assignee', 'parent', 'deps', 'round')}
+                if t['status'] is not None: row['status'] = t['status']
+                else: row['removed'] = True
+                row.update(title=t['proposal']['title'], ready=not blockers(tasks, ident), blocked=blockers(tasks, ident))
+                if op == 'history': row['events'] = t['history']
+                rows.append(row)
+            return {'ok': True, 'seq': len(events), 'protocol': tasks.protocol,
+                    'window': {'capacity': tasks.config['window_capacity'], 'occupied': occupied(tasks)} if tasks.protocol == 2 else None,
+                    'files': store.response_files(tasks, selected), 'tasks': rows}
         text(args.actor, '操作者', 200); text(args.request, '请求号', 200)
         data = {} if op == 'create' else {'id': args.id, 'expect': args.expect}
         if op in {'create', 'revise'}:
@@ -596,7 +637,7 @@ def execute(args):
             data['text'] = args.text
         if op == 'replan':
             data.update(plan=read_input(args.plan, '计划'), basis=args.basis)
-        if op == 'revise':
+        if op in {'revise', 'rework'}:
             data['basis'] = args.basis
         if op == 'deliver':
             data.update(artifacts=store.artifacts(args.artifact), receipt=read_input(args.receipt, '回执'),
@@ -607,6 +648,8 @@ def execute(args):
             require(prior['fingerprint'] == fingerprint, '同一请求号对应不同输入；拒绝重复执行，请核对原请求。', 'idempotency')
             return {'ok': True, 'already_applied': True, 'seq': prior['seq'], 'current_seq': len(events),
                     'task': prior['data'].get('id'), 'files': store.operation_files(events, prior['seq'])}
+        require(tasks.protocol == 2, '旧账只读；先 upgrade --preview 并明确升级。', 'upgrade_required')
+        state_pack.check(store, raw, events, tasks, args.context)
         if op == 'create':
             data['id'] = f"T{max([int(k[1:]) for k in tasks] or [0]) + 1:04d}"
         if op == 'revise':
@@ -616,19 +659,84 @@ def execute(args):
             if data['deps'] == {'keep': True}:
                 data['deps'] = list(tasks[args.id]['deps'])
         event = make_event(events, op, data, args.actor, args.request, fingerprint)
+        event.update(protocol=2, config=tasks.config, context=args.context)
         new_events = events + [event]
         updated = replay(new_events)
         if op == 'close':
             store.verify_delivery(updated[args.id])
+        state_pack.check(store, raw, events, tasks, args.context)
         store.commit(raw, new_events, updated)
         return {'ok': True, 'already_applied': False, 'seq': event['seq'], 'task': data.get('id'),
                 'files': store.operation_files(new_events, event['seq']),
-                'changed': [{'id': k, 'status': t['status'], 'revision': t['revision']} for k, t in updated.items()
+                'changed': [({'id': k, 'status': t['status'], 'revision': t['revision']} if t['status'] is not None else {'id': k, 'removed': True, 'revision': t['revision']}) for k, t in updated.items()
                             if t['revision'] == event['seq']]}
 
 
+def control(store, args, raw, events, tasks):
+    op = args.command
+    token = state_pack.edit_token(store, raw)
+    if op == 'config-show':
+        return {'ok': True, 'config': state_pack.load_config(store), 'seq': len(events), 'edit_token': token,
+                'recorded': tasks.config, 'note': 'edit_token 仅用于显式配置修复，不是任务写入状态版本。'}
+    policy = state_pack.load_config(store) if op == 'upgrade' else config(json.loads(read_input(args.file, '配置'), object_pairs_hook=__import__('queue_model').unique_object))
+    data = {'authority': get_authority(args)} if not args.preview else {'authority': {'by':'预检','basis':'只读预检，不构成授权'}}
+    operation = 'upgrade' if op == 'upgrade' else 'config'
+    if op == 'upgrade': data['source_sha256'] = args.expect_source or token
+    intent = sha(line({'operation': operation, 'data': data, 'config': policy, 'actor': args.actor}).encode())
+    prior = next((e for e in events if e['request'] == args.request), None) if args.request else None
+    if prior:
+        require(prior['fingerprint'] == intent, '同号输入不同。', 'idempotency')
+        return {'ok': True, 'already_applied': True, 'seq': prior['seq'], 'current_seq': len(events), 'files': store.operation_files(events, prior['seq'])}
+    if op == 'upgrade':
+        require(tasks.protocol == 1, '已经是新协议，不重复升级。', 'upgrade_required')
+        store.verify_files(tasks)
+    else:
+        require(tasks.protocol == 2, '先升级。', 'upgrade_required')
+        if args.recover:
+            expected = projections(tasks)
+            actual = store.actual_files(include_config=True)
+            require({k:v for k,v in expected.items() if k != CONFIG} == {k:v for k,v in actual.items() if k != CONFIG},
+                    '配置修复不能绕过任务投影检查；先 repair。', 'projection')
+        else:
+            store.verify_files(tasks)
+    event = make_event(events, operation, data, args.actor or 'preview', args.request or 'preview', intent)
+    event.update(protocol=2, config=policy, context=args.context or '')
+    updated = replay(events + [event])
+    if args.preview:
+        return {'ok': True, 'preview': True, 'source_sha256': token, 'window_occupied': occupied(updated),
+                'tasks': [{'id': k, 'stage': t['status']} for k, t in updated.items()], 'note': '旧事件与封卷不改写；升级只追加协议事件。'}
+    text(args.actor, '执行者', 200); text(args.request, '请求号', 200)
+    if op == 'upgrade' or args.recover:
+        require(args.expect_source == token, '预检指纹已变或未提供 --expect-source。', 'conflict')
+    else:
+        state_pack.check(store, raw, events, tasks, args.context)
+    # Verify every newly configured source before committing (never silently omit a file).
+    for path in policy['truth_whitelist']:
+        p = safe(store.root, path)
+        require(p.is_file(), f'白名单文件不存在：{path}', 'state_source')
+        require('\x00' not in p.read_bytes().decode('utf-8'), '白名单文件须为文本。', 'state_source')
+    if op == 'upgrade':
+        store.atomic_write(safe(store.root, LOCAL + '/upgrade/' + token + '/ledger.jsonl'), raw)
+    store.commit(raw, events + [event], updated)
+    return {'ok': True, 'already_applied': False, 'seq': event['seq'], 'files': store.operation_files(events + [event], event['seq'])}
+
+
+def normalize(argv):
+    argv = list(argv)
+    i = 0
+    while i < len(argv) and argv[i] in {'--root','--wait'}: i += 2
+    if i < len(argv):
+        group = argv[i]
+        if group == 'task' and i + 1 < len(argv):
+            argv.pop(i)
+            argv[i] = {'register':'create', 'pass':'close'}.get(argv[i], argv[i])
+        elif group in {'state', 'config'} and i + 1 < len(argv):
+            argv[i:i+2] = [group + '-' + argv[i+1]]
+    return argv
+
+
 def main(argv=None):
-    args = parser().parse_args(argv)
+    args = parser().parse_args(normalize(sys.argv[1:] if argv is None else argv))
     try:
         result = execute(args)
         print(json.dumps(result, ensure_ascii=False))

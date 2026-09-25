@@ -18,7 +18,7 @@ PROPOSAL_KEYS = {'title', 'origin', 'scope', 'criteria', 'plan'}
 SECTIONS = {'来源与目的': 'origin', '范围': 'scope', '验收标准与验证方法': 'criteria', '执行计划': 'plan'}
 LABELS = {'create': '登记', 'revise': '修订提案', 'approve': '批准执行', 'claim': '领取',
           'release': '让出', 'handoff': '交接', 'replan': '修订计划', 'deliver': '交付',
-          'close': '验收通过', 'revoke': '撤销', 'cancel': '取消', 'import': '导入候裁任务'}
+          'close': '验收通过', 'revoke': '撤销', 'cancel': '取消', 'import': '导入候裁任务', 'upgrade': '升级', 'config': '配置', 'rework': '返工'}
 
 
 class QueueError(Exception):
@@ -362,12 +362,22 @@ def apply(tasks, event):
     return touched
 
 
+class TaskMap(dict):
+    protocol = 1
+    config = None
+
+
 def replay(events):
-    tasks, requests = {}, set()
+    tasks, requests = TaskMap(), set()
     for seq, event in enumerate(events, 1):
         require(isinstance(event, dict) and event.get('seq') == seq, '账本全局序号不连续。', 'corrupt')
         require(event.get('request') not in requests, '账本请求号重复。', 'corrupt')
-        apply(tasks, event)
+        if 'protocol' in event:
+            from queue_v2 import apply as apply_v2
+            apply_v2(tasks, event)
+        else:
+            require(tasks.protocol == 1, '升级后不得再追加旧协议事件。', 'format')
+            apply(tasks, event)
         requests.add(event['request'])
     return tasks
 

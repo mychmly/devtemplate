@@ -1,0 +1,7 @@
+{
+  "truth_whitelist": [
+    "truth/goals.md"
+  ],
+  "version": 1,
+  "window_capacity": 8
+}

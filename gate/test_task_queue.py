@@ -23,7 +23,7 @@ TEMPLATE_FILES = ('.gitignore', 'AGENTS.md', 'LICENSE', 'README.md',
     'charter/AGENTS.md', 'charter/project.md', 'truth/AGENTS.md', 'truth/goals.md',
     'queue/AGENTS.md', 'queue/templates/task.md', 'queue/templates/receipt.md', 'queue/tasks/.gitkeep',
     'gate/AGENTS.md', 'gate/checks.md', 'gate/test_task_queue.py', 'gate/subagent-e2e.md',
-    'tool/AGENTS.md', 'tool/catalog.md', 'tool/task_queue.py', 'tool/queue_model.py', 'tool/queue-usage.md',
+    'tool/AGENTS.md', 'tool/catalog.md', 'tool/task_queue.py', 'tool/queue_model.py', 'tool/queue-usage.md', 'tool/queue_v2.py', 'tool/state_pack.py', 'tool/shell.py', 'charter/config.json',
     'eval/AGENTS.md', 'eval/catalog.md', 'reference/AGENTS.md', 'object/AGENTS.md')
 ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 ENV.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
@@ -106,13 +106,31 @@ class Repo:
             raise AssertionError(f'CLI did not return JSON:\n{p.stdout}\n{p.stderr}')
 
     def write(self, op, ident=None, *args, actor='Agent A', request=None, expect=None, expected=0):
+        auto_revision = expect is None
         flags = [op]
         if ident:
             if expect is None:
-                expect = self.status(ident)['revision']
+                expect = self.call('history', ident)['tasks'][0]['revision']
             flags += [ident, '--expect', str(expect)]
         flags += ['--actor', actor, '--request', request or uuid.uuid4().hex, *map(str, args)]
-        return self.call(*flags, expected=expected)
+        for attempt in range(40):
+            state = self.call('state-get', expected=None)
+            if state.get('code') == 'upgrade_required':
+                preview = self.call('upgrade', '--preview')
+                self.call('upgrade', '--expect-source', preview['source_sha256'], '--actor', actor,
+                          '--request', 'fixture-upgrade', *AUTH)
+                state = self.call('state-get')
+                if ident and auto_revision:
+                    flags[flags.index('--expect') + 1] = str(self.status(ident)['revision'])
+            actual = flags + (['--context', state['context']] if state.get('ok') else [])
+            p = run(self.argv(*actual), self.repo, None)
+            result = json.loads(p.stdout if p.returncode == 0 else p.stderr)
+            if expected == 0 and op == 'create' and result.get('code') == 'stale_context':
+                continue  # same logical request; refresh only after explicit stale rejection
+            if expected is not None and p.returncode != expected:
+                raise AssertionError(f'{actual}\nexit={p.returncode} wanted={expected}\n{p.stdout}{p.stderr}')
+            return result
+        raise AssertionError('fixture retries exhausted')
 
     def create(self, approve=True, parent=None, deps=(), **kwargs):
         args = ['--proposal', str(self.proposal)]
@@ -134,6 +152,8 @@ class Repo:
         return [json.loads(s) for s in self.raw().splitlines()[1:]]
 
     def deliver(self, ident, result='passed', actor='Agent A'):
+        if self.status(ident)['status'] == '交付':
+            self.write('rework', ident, '--basis', '测试中重新验证并交付', actor=actor)
         artifact = self.root / 'object/result.txt'
         artifact.write_text('result OK\n')
         check = run([sys.executable, '-c', 'from pathlib import Path; assert Path("object/result.txt").read_text() == "result OK\\n"; print("RESULT PASS")'], self.root)
@@ -156,7 +176,7 @@ class QueueIntegration(unittest.TestCase):
 
     def test_01_init_doctor_and_real_successful_commit(self):
         self.assertEqual(self.r.call('doctor')['protection'], 'ready')
-        self.assertEqual(self.r.call('init')['seq'], 0)
+        self.assertEqual(self.r.call('init')['seq'], 1)
         self.assertEqual(self.r.commit().returncode, 0)
         tracked = self.r.git('ls-files').stdout
         self.assertIn('.shell/queue/ledger.jsonl', tracked)
@@ -166,12 +186,12 @@ class QueueIntegration(unittest.TestCase):
         ident = self.r.create()['task']
         self.r.write('claim', ident)
         self.r.deliver(ident)
-        self.assertEqual(self.r.status(ident)['status'], '批准执行')
+        self.assertEqual(self.r.status(ident)['status'], '交付')
         self.r.write('close', ident, *AUTH)
         item = self.r.status(ident)
-        self.assertEqual((item['status'], item['assignee']), ('收官', None))
+        self.assertEqual((item['status'], item['assignee']), ('通过', None))
         self.assertEqual(self.r.commit().returncode, 0)
-        self.assertIn('Agent 代书，未独立见证', (self.r.root / f'queue/tasks/{ident}/task.md').read_text())
+        self.assertIn('未独立见证', (self.r.root / f'queue/tasks/{ident}/task.md').read_text())
 
     def test_03_candidate_cannot_claim_or_close(self):
         ident = self.r.create(approve=False)['task']
@@ -285,7 +305,7 @@ class QueueIntegration(unittest.TestCase):
         self.assertEqual(len(self.r.events()), before + 1)
         for ident in (parent, child):
             row = self.r.status(ident)
-            self.assertEqual((row['status'], row['assignee']), ('候裁', None))
+            self.assertEqual((row['status'], row['assignee']), ('登记', None))
 
     def test_16_stale_task_and_subtree_versions_rejected(self):
         ident = self.r.create()['task']; old = self.r.status(ident)['revision']
@@ -298,7 +318,7 @@ class QueueIntegration(unittest.TestCase):
         second = self.r.create(request='same-request')
         self.assertEqual(first['task'], second['task'])
         self.assertTrue(second['already_applied'])
-        self.assertEqual(len(self.r.events()), 1)
+        self.assertEqual(len(self.r.events()), 2)
         self.r.proposal.write_text(PROPOSAL.replace('集成测试任务', '另一个任务'))
         self.assertEqual(self.r.create(request='same-request', expected=1)['code'], 'idempotency')
 
@@ -313,9 +333,9 @@ class QueueIntegration(unittest.TestCase):
 
     def test_19_parallel_registration_has_no_duplicate_or_lost_ids(self):
         with ThreadPoolExecutor(max_workers=8) as pool:
-            ids = list(pool.map(lambda _: self.r.create()['task'], range(12)))
+            ids = list(pool.map(lambda _: self.r.create(approve=False)['task'], range(12)))
         self.assertEqual(sorted(ids), [f'T{i:04d}' for i in range(1, 13)])
-        self.assertEqual(self.r.call('doctor')['seq'], 12)
+        self.assertEqual(self.r.call('doctor')['seq'], 13)
 
     def test_20_tampered_projection_is_detected_and_repair_preserves_difference(self):
         ident = self.r.create()['task']
@@ -364,7 +384,7 @@ class QueueIntegration(unittest.TestCase):
     def test_24_real_commit_rejects_sealed_volume_changes(self):
         ident = self.r.create(approve=False)['task']; self.r.write('cancel', ident, *AUTH)
         self.assertEqual(self.r.commit().returncode, 0)
-        (self.r.root / f'queue/tasks/{ident}/extra.md').write_text('封存后增加')
+        (self.r.root / f'.shell/queue/archive/{ident}/extra.md').write_text('封存后增加')
         self.r.git('add', '.')
         self.assertNotEqual(self.r.git('commit', '-qm', 'sealed extra', expected=None).returncode, 0)
 
@@ -425,7 +445,7 @@ class QueueIntegration(unittest.TestCase):
         self.assertIn('保护未就绪', p.stderr)
         run([sys.executable, '-B', dest / 'tool/task_queue.py', 'init'], dest)
         status = run([sys.executable, '-B', dest / 'tool/task_queue.py', 'status', ident], dest)
-        self.assertEqual(json.loads(status.stdout)['tasks'][0]['status'], '批准执行')
+        self.assertEqual(json.loads(status.stdout)['tasks'][0]['status'], '批准')
 
     def test_33_symlink_artifact_and_managed_symlink_are_rejected(self):
         if not hasattr(os, 'symlink'):
@@ -529,28 +549,29 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
         return p
 
     def crash_create_args(self):
-        return ['create', '--proposal', str(self.r.proposal), '--actor', 'Agent A', '--request', 'crash-create']
+        return ['create', '--proposal', str(self.r.proposal), '--actor', 'Agent A', '--request', 'crash-create', '--context', self.r.call('state-get')['context']]
 
     def test_38_kill_before_ledger_replace_leaves_old_valid_state(self):
         old = self.r.raw()
         p = self.paused_child('before-ledger', self.crash_create_args())
         p.kill(); p.communicate(timeout=5)
         self.assertEqual(self.r.raw(), old)
-        self.assertEqual(self.r.call('status')['seq'], 0)
-        self.assertEqual(self.r.call(*self.crash_create_args())['seq'], 1)
+        self.assertEqual(self.r.call('status')['seq'], 1)
+        self.assertEqual(self.r.call(*self.crash_create_args())['seq'], 2)
 
     def test_39_kill_after_commit_recovers_projection_without_duplicate_event(self):
         p = self.paused_child('after-ledger', self.crash_create_args())
         p.kill(); p.communicate(timeout=5)
-        self.assertEqual(len(self.r.events()), 1)
+        self.assertEqual(len(self.r.events()), 2)
         retried = self.r.call(*self.crash_create_args())
         self.assertTrue(retried['already_applied'])
-        self.assertEqual(self.r.call('doctor')['seq'], 1)
+        self.assertEqual(self.r.call('doctor')['seq'], 2)
         self.assertTrue((self.r.root / 'queue/tasks/T0001/task.md').exists())
 
     def test_40_real_lock_contention_and_killed_owner_auto_release(self):
+        args = self.crash_create_args()
         p = self.paused_child('lock', [])
-        result = self.r.call('--wait', '0', *self.crash_create_args(), expected=1)
+        result = self.r.call('--wait', '0', *args, expected=1)
         self.assertEqual(result['code'], 'busy')
         p.kill(); p.communicate(timeout=5)
         self.assertTrue(self.r.call(*self.crash_create_args())['ok'])
@@ -561,7 +582,7 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
         before = self.r.raw()
         self.r.write('revoke', parent, *AUTH, expected=1)
         self.assertEqual(self.r.raw(), before)
-        self.assertEqual(self.r.status(child)['status'], '批准执行')
+        self.assertEqual(self.r.status(child)['status'], '批准')
 
     def test_42_hook_failure_is_fail_closed_and_no_verify_limit_is_explicit(self):
         self.r.create()
@@ -586,7 +607,8 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
         before = len(self.r.events())
         self.r.write('cancel', root, *AUTH, '--tree', '--expect-seq', str(before))
         self.assertEqual(len(self.r.events()), before + 1)
-        self.assertTrue(all(self.r.status(i)['status'] == '驳回' for i in (root, left, right, leaf)))
+        self.assertEqual(self.r.call('status')['tasks'], [])
+        self.assertTrue(all(self.r.call('history', i)['tasks'][0]['removed'] for i in (root, left, right, leaf)))
 
     def test_44_normal_projection_updates_do_not_accumulate_recovery_copies(self):
         ident = self.r.create()['task']; self.r.write('claim', ident)
@@ -595,10 +617,10 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
 
     def test_45_user_authorization_record_can_be_attached_without_reasking(self):
         ident = self.r.create()['task']
-        event = self.r.events()[0]
+        event = self.r.events()[1]
         self.assertEqual(event['data']['authority']['by'], AUTH[1])
-        self.assertEqual(self.r.status(ident)['status'], '批准执行')
-        self.assertEqual(len(self.r.events()), 1)
+        self.assertEqual(self.r.status(ident)['status'], '批准')
+        self.assertEqual(len(self.r.events()), 2)
 
     def test_46_live_legacy_hook_rejection_still_blocks_commit(self):
         other = Repo(self.tmp.name, 'legacy-reject', legacy_hooks=True)
@@ -657,7 +679,7 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
         self.r.write('approve', ident, *AUTH)
         result = self.r.write('revise', ident, *flags, request='revise-once', expect=old)
         self.assertTrue(result['already_applied'])
-        self.assertEqual(self.r.status(ident)['status'], '批准执行')
+        self.assertEqual(self.r.status(ident)['status'], '批准')
 
     def test_53_new_generated_approval_passes_git_whitespace_check(self):
         ident = self.r.create()['task']
@@ -673,12 +695,19 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
         if terminal:
             self.r.write('claim', ident); self.r.deliver(ident); self.r.write('close', ident, *AUTH)
         ledger = self.r.root / '.shell/queue/ledger.jsonl'
-        rows = [json.loads(s) for s in ledger.read_text().splitlines()]
-        for event in rows[1:]:
-            event.pop('projection_version', None)
-        ledger.write_text(''.join(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n' for r in rows))
-        baseline = self.r.root / f'queue/tasks/{ident}/approval-001.md'
-        baseline.write_bytes(baseline.read_bytes().rstrip(b'\n') + b'\n\n')
+        rows = [json.loads(x) for x in ledger.read_text().splitlines()]
+        events = rows[2:]
+        for event in events:
+            for key in ('projection_version','protocol','config','context'): event.pop(key, None)
+            event['seq'] -= 1
+            if 'expect' in event['data']: event['data']['expect'] -= 1
+        ledger.write_text(''.join(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n' for r in [rows[0], *events]))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('legacy_model_fixture', SOURCE / 'tool/queue_model.py')
+        model = importlib.util.module_from_spec(spec); spec.loader.exec_module(model)
+        for path in (self.r.root / 'queue/tasks'/ident).iterdir(): path.unlink()
+        for name, content in model.projections(model.replay(events)).items():
+            target = self.r.root / name; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(content)
         self.r.call('doctor')
         self.assertEqual(self.r.commit().returncode, 0)
         home = self.r.root / f'queue/tasks/{ident}'
@@ -728,7 +757,7 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
         self.assertEqual(task['task'], f'queue/tasks/{ident}/task.md')
         self.assertEqual(task['approval'], f'queue/tasks/{ident}/approval-001.md')
         self.assertIsNone(task['receipt'])
-        self.assertEqual(set(files['stage_paths']), {files['ledger'], task['task'], task['approval']})
+        self.assertEqual(set(files['stage_paths']), {files['ledger'], *task['package']})
         for name in files['stage_paths']:
             self.assertFalse(Path(name).is_absolute())
             self.assertTrue((Path(files['base']) / name).is_file())
@@ -744,7 +773,7 @@ sys.exit(q.main(['--root',root]+sys.argv[4:]))
                 '--verification', 'passed', '--summary', '回执路径定位']
         first = self.r.write('deliver', ident, *args, request='path-retry', expect=rev)
         receipt = first['files']['tasks'][0]['receipt']
-        self.assertTrue(receipt.endswith('receipt-000003.md'))
+        self.assertTrue(receipt.endswith('receipt-000004.md'))
         self.assertIn('object/result.txt', first['files']['stage_paths'])
         self.r.write('handoff', ident, '--text', '后续事件不应改变旧请求的文件定位')
         again = self.r.write('deliver', ident, *args, request='path-retry', expect=rev)
