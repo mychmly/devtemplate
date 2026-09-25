@@ -1,0 +1,8 @@
+# 接入已有项目时只合并需要的规则，不覆盖原有规则。
+.DS_Store
+Thumbs.db
+
+# 本机队列运行态不入库；.shell/queue/ledger.jsonl 必须入库。
+/.shell/local/
+__pycache__/
+*.pyc
