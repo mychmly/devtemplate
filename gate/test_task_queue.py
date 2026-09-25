@@ -20,7 +20,7 @@ import uuid
 
 SOURCE = Path(__file__).resolve().parents[1]
 TEMPLATE_FILES = ('.gitignore', 'AGENTS.md', 'LICENSE', 'README.md',
-    'charter/AGENTS.md', 'charter/project.md', 'truth/AGENTS.md', 'truth/goals.md',
+    'charter/AGENTS.md', 'truth/AGENTS.md', 'truth/goals.md',
     'queue/AGENTS.md', 'queue/templates/task.md', 'queue/templates/receipt.md', 'queue/tasks/.gitkeep',
     'gate/AGENTS.md', 'gate/checks.md', 'gate/test_task_queue.py', 'gate/subagent-e2e.md',
     'tool/AGENTS.md', 'tool/catalog.md', 'tool/task_queue.py', 'tool/queue_model.py', 'tool/queue-usage.md', 'tool/queue_v2.py', 'tool/state_pack.py', 'tool/shell.py', 'charter/config.json',

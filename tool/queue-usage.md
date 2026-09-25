@@ -11,7 +11,7 @@ python3 tool/shell.py state get
 python3 tool/shell.py task status
 ```
 
-先填写 charter/project.md、truth/goals.md 并取得用户确认，再接入。新克隆须 init 安装本机钩子；已有钩子保留并串接。doctor 应为 `protection: ready` 且 `protocol: 2`。原 v1 账只读，须按下文显式升级，不自动猜测转换。
+先按入口读取区域契约、核对工作对象位置和用户授权，填写 truth/goals.md；需要常驻的规则写进对应区域契约，不另建接入表。新克隆须 init 安装本机钩子；已有钩子保留并串接。doctor 应为 `protection: ready` 且 `protocol: 2`。原 v1 账只读，须按下文显式升级，不自动猜测转换。
 
 `state get` 返回 `context`、`base`、`manifest` 和 `files`。**按 files 中每个 source 的 parts 顺序读取全部分片**；拼接即该源文件全文，无附加摘要。清单是校验元数据，不是第三类业务内容。首次 Session 读全包；后续可按源指纹识别变化再读。charter/入口规则仍按 AGENTS.md 单独阅读，不被偷偷加入状态包。
 

@@ -7,7 +7,7 @@
 ## 开始使用
 
 1. 克隆模板，或按下节合入已有项目。
-2. 让 Agent 填写 [项目接入信息](charter/project.md) 与 [目标](truth/goals.md)，由用户核对身份、位置与可写范围。模板本身不提供施工授权。
+2. 让 Agent 核对 [协作边界](charter/AGENTS.md)、[工作对象契约](object/AGENTS.md)，并填写 [目标](truth/goals.md)。需要常驻的规则写进对应区域契约，不另填接入表；用户已明确的范围不重复请批。模板本身不提供施工授权。
 3. Agent 检查 Python 与 Git，并在模板根执行 `python3 tool/shell.py init`，然后执行 `python3 tool/shell.py doctor`。只有报告 `protection: ready` 且 `protocol: 2` 才表示队列接线已就绪。
 4. Agent 经 `python3 tool/shell.py state get` 获取并读取完整状态包：仅包含白名单 truth 文件全文和窗口内任务包文件全文。每次受控写入使用自己的状态版本，过期就重新获取并读变化。
 5. Agent 按 [方案模板](queue/templates/task.md) 起草，使用队列工具登记。用户已说“按此方案实施”时，直接记录这条指令并进入批准执行，不重复请批。
@@ -28,7 +28,7 @@
 | 入口 | 职责 | 形态 |
 |---|---|---|
 | [AGENTS.md](AGENTS.md) | Agent 公共入口 | 人工维护 |
-| [charter](charter/AGENTS.md) | 协作边界与项目接入信息 | 人工维护 |
+| [charter](charter/AGENTS.md) | 跨区域常设协作规则与机器配置 | 契约人工维护，接入后配置经工具维护 |
 | [truth](truth/AGENTS.md) | 项目长期目标与已定要求 | 人工维护 |
 | [queue](queue/AGENTS.md) | 任务阅读视图、批准基线与证据 | 工具维护 |
 | `.shell/queue/` | 任务唯一机器账 | 初始化时创建，随 Git 保存 |

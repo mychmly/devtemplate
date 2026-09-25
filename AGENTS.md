@@ -4,7 +4,7 @@
 
 ## 开始前
 
-1. 读 [协作边界](charter/AGENTS.md)、[项目接入信息](charter/project.md) 与 [项目目标](truth/goals.md)，确认批准人、项目位置和可写范围。接入信息不完整时先协助填写与澄清，不猜权限。
+1. 读 [协作边界](charter/AGENTS.md)、[工作对象契约](object/AGENTS.md) 与 [项目目标](truth/goals.md)，核对用户指令、工作对象位置和可写范围。常设规则归对应区域契约，单次任务范围与授权归任务；缺失时澄清，不猜权限，不另建接入表。
 2. 读 [任务规则](queue/AGENTS.md) 与 [队列工具用法](tool/queue-usage.md)。运行 `python3 tool/shell.py doctor`；应为 protection: ready 且 protocol: 2；未初始化或旧协议时按用法接入，不把“保护未就绪”当作可以无保护施工。
 3. 经 `python3 tool/shell.py state get` 获取当前状态包，按返回的 files/parts 读完全文；正文仅含 truth 白名单与窗口内任务包，charter 等规则仍按本入口单独读。通过 task status 查询版本与就绪情况，读取对应任务、批准基线与证据。没有任务时起草方案并登记；用户已明确授权实施的，可在登记时同时记录授权，不另问一次形式上的批准。
 4. 简短汇报本轮任务、实际读了什么、缺失或冲突与下一步。触及某区前读该区 AGENTS.md；对象另遵守自身规则。
